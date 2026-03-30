@@ -17,14 +17,18 @@ import re
 import textwrap
 from typing import List, Dict, Any
 
-from openai import OpenAI
 import json
+import requests
+from dotenv import load_dotenv
 
 from satellite_env import SatelliteConstellationEnv, Action, EasyTask, MediumTask, HardTask
 
-API_BASE_URL = os.getenv("API_BASE_URL")  # "https://router.huggingface.co/v1"
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME")
+load_dotenv()
+
+# Groq configuration
+GROQ_API_URL = os.getenv("GROQ_API_URL") or os.getenv("API_BASE_URL") or os.getenv("GROQ_API_BASE")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+MODEL_NAME = os.getenv("MODEL_NAME") or os.getenv("GROQ_MODEL") or "groq-1"
 MAX_STEPS = 50
 TEMPERATURE = 0.2
 MAX_TOKENS = 300
@@ -160,8 +164,17 @@ def parse_model_action(response_text: str, num_satellites: int) -> Dict[str, Any
 def run_inference(task_name: str = "easy") -> Dict[str, Any]:
     """Run inference on the specified task."""
 
-    # Initialize OpenAI client
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # Initialize Groq client (HTTP)
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY or API_KEY environment variable not set")
+
+    if not GROQ_API_URL:
+        GROQ_API_URL = f"https://api.groq.ai/v1/models/{MODEL_NAME}/completions"
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
     # Set up task
     if task_name == "easy":
@@ -195,14 +208,25 @@ def run_inference(task_name: str = "easy") -> Dict[str, Any]:
             ]
 
             try:
-                completion = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
-                    stream=False,
-                )
-                response_text = completion.choices[0].message.content or ""
+                payload = {
+                    "prompt": SYSTEM_PROMPT + "\n" + user_prompt,
+                    "max_tokens": MAX_TOKENS,
+                    "temperature": TEMPERATURE,
+                }
+                resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+                resp.raise_for_status()
+                body = resp.json()
+                # extract text
+                response_text = ""
+                if isinstance(body, dict):
+                    if "choices" in body and len(body["choices"]) > 0:
+                        first = body["choices"][0]
+                        response_text = first.get("text") or first.get("message", {}).get("content", "")
+                    elif "output" in body:
+                        out = body["output"]
+                        response_text = out[0] if isinstance(out, list) and len(out) > 0 else (out if isinstance(out, str) else "")
+                if not response_text:
+                    response_text = json.dumps(body)
             except Exception as exc:
                 print(f"Model request failed ({exc}). Using fallback action.")
                 response_text = json.dumps(FALLBACK_ACTION)
@@ -248,9 +272,9 @@ def run_inference(task_name: str = "easy") -> Dict[str, Any]:
 def main() -> None:
     """Main function to run inference on all tasks."""
 
-    if not all([API_BASE_URL, API_KEY, MODEL_NAME]):
+    if not all([GROQ_API_URL, GROQ_API_KEY, MODEL_NAME]):
         print("Error: Missing required environment variables:")
-        print("  API_BASE_URL, API_KEY (or HF_TOKEN), MODEL_NAME")
+        print("  GROQ_API_URL (or API_BASE_URL), GROQ_API_KEY (or API_KEY/HF_TOKEN), MODEL_NAME")
         return
 
     tasks = ["easy", "medium", "hard"]

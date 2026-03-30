@@ -136,10 +136,11 @@ state = env.state()
 
 ## Baseline Scores
 
-Run the baseline inference script to get reproducible scores:
+Run the baseline inference script to get reproducible scores (using Groq):
 
 ```bash
-export OPENAI_API_KEY="your-api-key-here"
+export GROQ_API_KEY="your-api-key-here"
+export GROQ_API_URL="https://api.groq.ai/v1/models/<model>/completions"  # optional
 python baseline.py
 ```
 
