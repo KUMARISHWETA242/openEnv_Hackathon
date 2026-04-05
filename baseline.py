@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Baseline script using Groq HTTP completions (single clean implementation).
+Baseline script using Hugging Face Inference HTTP completions (single clean implementation).
 
-- Uses GROQ_API_KEY / GROQ_API_URL / MODEL_NAME (or GROQ_MODEL)
+- Uses HF_TOKEN / API_BASE_URL / MODEL_NAME (or HF_MODEL)
 - Supports offline mode via GROQ_OFFLINE=1 to avoid network calls during dev
 - Writes results to baseline_results.json
 """
@@ -13,6 +13,7 @@ import textwrap
 from typing import Any, Dict
 
 import requests
+from openai import OpenAI
 from requests.exceptions import RequestException
 from dotenv import load_dotenv
 
@@ -21,18 +22,25 @@ from satellite_env import SatelliteConstellationEnv, Action, EasyTask, MediumTas
 # Load environment variables from .env if present
 load_dotenv()
 
-MODEL_NAME = os.getenv("MODEL_NAME") or os.getenv("GROQ_MODEL") or "groq-1"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_API_URL = os.getenv("GROQ_API_URL") or os.getenv("GROQ_API_BASE")
+# Hugging Face config
+MODEL_NAME = os.getenv("MODEL_NAME") or os.getenv("HF_MODEL") or "gpt2"
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or HF_TOKEN
+API_BASE_URL = os.getenv("API_BASE_URL")
 GROQ_OFFLINE = os.getenv("GROQ_OFFLINE", "0") in ("1", "true", "True")
 
-if not GROQ_API_KEY and not GROQ_OFFLINE:
-    raise RuntimeError("GROQ_API_KEY is required unless GROQ_OFFLINE=1 is set")
+if not os.getenv("HF_TOKEN") and not GROQ_OFFLINE:
+    raise RuntimeError("HF_TOKEN (or OPENAI_API_KEY/API_KEY) is required unless GROQ_OFFLINE=1 is set")
 
-if not GROQ_API_URL:
-    GROQ_API_URL = f"https://api.groq.ai/v1/models/{MODEL_NAME}/completions"
-
-HEADERS = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+# instantiate the provided wrapper client pointing to HF router
+try:
+    client = OpenAI(
+        base_url="https://router.huggingface.co/v1",
+        api_key=os.environ["HF_TOKEN"],
+    )
+except KeyError:
+    if not GROQ_OFFLINE:
+        raise ValueError("HF_TOKEN environment variable not set; required to instantiate OpenAI wrapper client")
 
 
 def build_prompt(state: Dict[str, Any], desc: str) -> str:
@@ -42,21 +50,30 @@ def build_prompt(state: Dict[str, Any], desc: str) -> str:
     State:
     {json.dumps(state, indent=2)}
 
-    Return a JSON object: {{"satellite_actions": {{"0": "capture", "1": "idle"}}}}
+    Return only a valid JSON object with the following format, no additional text or explanation:
+    {{"satellite_actions": {{"0": "capture", "1": "idle"}}}}
     """
     )
 
 
 def parse_response_text(text: str, num_satellites: int) -> Action:
+    print(f"Raw response text: {repr(text)}")
     try:
         parsed = json.loads(text)
-    except Exception:
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error: {e}")
         import re
-
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
+            print("No JSON found in response")
             return Action(satellite_actions={i: "idle" for i in range(num_satellites)})
-        parsed = json.loads(m.group(0))
+        json_str = m.group(0)
+        print(f"Extracted JSON: {repr(json_str)}")
+        try:
+            parsed = json.loads(json_str)
+        except json.JSONDecodeError as e2:
+            print(f"Failed to parse extracted JSON: {e2}")
+            return Action(satellite_actions={i: "idle" for i in range(num_satellites)})
 
     actions = {}
     for i in range(num_satellites):
@@ -71,33 +88,32 @@ def get_action(state: Dict[str, Any], desc: str) -> Action:
     if GROQ_OFFLINE:
         return Action(satellite_actions={i: "idle" for i in range(num_sat)})
 
-    payload = {"prompt": build_prompt(state, desc), "max_tokens": 256, "temperature": 0.1}
     try:
-        r = requests.post(GROQ_API_URL, headers=HEADERS, json=payload, timeout=10)
-        r.raise_for_status()
-        body = r.json()
+        prompt = build_prompt(state, desc)
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+            temperature=0.1,
+        )
 
         text = None
-        if isinstance(body, dict):
-            if "choices" in body and body["choices"]:
-                c = body["choices"][0]
-                text = c.get("text") or c.get("message", {}).get("content")
-            elif "output" in body:
-                out = body["output"]
-                text = out[0] if isinstance(out, list) and out else (out if isinstance(out, str) else None)
+        if resp and getattr(resp, "choices", None):
+            first = resp.choices[0]
+            msg = getattr(first, "message", None) or first
+            text = (msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)) or first.get("text", "")
 
         if not text:
-            text = json.dumps(body)
+            text = json.dumps(resp)
 
         return parse_response_text(text, num_sat)
 
     except RequestException as ex:
-        print(f"Network/Groq request failed: {ex}")
+        print(f"Network request failed: {ex}")
         return Action(satellite_actions={i: "idle" for i in range(num_sat)})
     except Exception as ex:
         print(f"Unexpected parsing error: {ex}")
         return Action(satellite_actions={i: "idle" for i in range(num_sat)})
-
 
 def run_task(task, name: str) -> float:
     env = SatelliteConstellationEnv()
@@ -111,6 +127,7 @@ def run_task(task, name: str) -> float:
         action = get_action(st, task.description)
         obs, reward, done, info = env.step(action)
         actions_taken.append(action)
+        print(f"Reward: {reward}")
     score = grader.grade_episode(env, actions_taken, env.state())
     print(f"{name} score: {score:.3f}")
     return score

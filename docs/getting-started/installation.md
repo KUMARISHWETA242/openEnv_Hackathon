@@ -116,7 +116,7 @@ Once installed, you can:
 
 - [Run the Quick Start guide](quick-start.md)
 - [Learn basic usage](basic-usage.md)
-- [Explore the API](api-reference/core-classes.md)
+- [Explore the API](../api-reference/core-classes.md)
 
 ## Support
 
