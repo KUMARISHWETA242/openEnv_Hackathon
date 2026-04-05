@@ -1,11 +1,10 @@
 from typing import List, Dict, Any, Tuple
 from pydantic import BaseModel
 import numpy as np
-from dataclasses import dataclass
 
 class SatelliteState(BaseModel):
     id: int
-    position: Tuple[float, float, float]  # x, y, z in orbit
+    position: Tuple[float, float, float]  # latitude, longitude, altitude_km
     battery: float  # 0-100
     storage: float  # 0-100 (percentage used)
     last_action: str
@@ -26,11 +25,17 @@ class Reward(BaseModel):
 
 class SatelliteConstellationEnv:
     def __init__(self, num_satellites: int = 5, max_steps: int = 100):
+        self.earth_radius_km = 6371.0
+        self.downlink_range_km = 2200.0
         self.num_satellites = num_satellites
         self.max_steps = max_steps
         self.current_step = 0
         self.satellites = []
-        self.ground_stations = [(0, 0), (45, 90), (-30, 120)]  # example locations
+        self.ground_stations = [
+            (28.6139, 77.2090),   # New Delhi
+            (1.3521, 103.8198),   # Singapore
+            (34.0522, -118.2437), # Los Angeles
+        ]
         self.weather = {"region1": 0.2, "region2": 0.5}  # cloud cover
         self.pending_tasks = []
         self._reset_satellites()
@@ -38,14 +43,35 @@ class SatelliteConstellationEnv:
     def _reset_satellites(self):
         self.satellites = []
         for i in range(self.num_satellites):
-            pos = (np.random.uniform(-6371, 6371), np.random.uniform(-6371, 6371), np.random.uniform(400, 600))  # rough orbit
+            altitude = np.random.uniform(450, 650)
+            inclination = np.random.uniform(-65, 65)
+            phase = np.random.uniform(0, 2 * np.pi)
+            angular_velocity = np.random.uniform(6, 14)
+            position = self._orbit_position_from_phase(phase, inclination, altitude)
             self.satellites.append({
                 'id': i,
-                'position': pos,
+                'position': position,
                 'battery': 100.0,
                 'storage': 0.0,
-                'last_action': 'idle'
+                'last_action': 'idle',
+                'orbit_phase': phase,
+                'angular_velocity': angular_velocity,
+                'inclination': inclination,
+                'altitude': altitude,
             })
+
+    def _orbit_position_from_phase(self, phase: float, inclination: float, altitude: float) -> Tuple[float, float, float]:
+        latitude = float(np.clip(inclination * np.sin(phase), -85.0, 85.0))
+        longitude = float(((np.degrees(phase) % 360.0) + 180.0) % 360.0 - 180.0)
+        return (latitude, longitude, altitude)
+
+    def _advance_satellite_orbit(self, sat: Dict[str, Any]) -> None:
+        sat['orbit_phase'] = (sat['orbit_phase'] + np.deg2rad(sat['angular_velocity'])) % (2 * np.pi)
+        sat['position'] = self._orbit_position_from_phase(
+            sat['orbit_phase'],
+            sat['inclination'],
+            sat['altitude'],
+        )
 
     def reset(self) -> Observation:
         self.current_step = 0
@@ -94,14 +120,9 @@ class SatelliteConstellationEnv:
 
             sat['last_action'] = act
 
-        # Update positions (simple simulation)
+        # Update positions using a lightweight orbital ground-track approximation
         for sat in self.satellites:
-            # Simple orbital motion
-            sat['position'] = (
-                sat['position'][0] + np.random.uniform(-10, 10),
-                sat['position'][1] + np.random.uniform(-10, 10),
-                sat['position'][2]
-            )
+            self._advance_satellite_orbit(sat)
 
         # Battery drain over time
         for sat in self.satellites:
@@ -136,9 +157,25 @@ class SatelliteConstellationEnv:
 
     def _can_downlink(self, sat_id: int) -> bool:
         sat = self.satellites[sat_id]
+        sat_lat, sat_lon, _ = sat['position']
         # Simple check: if near a ground station
         for gs in self.ground_stations:
-            dist = np.linalg.norm(np.array(sat['position'][:2]) - np.array(gs))
-            if dist < 500:  # arbitrary distance
+            dist = self._ground_distance_km(sat_lat, sat_lon, gs[0], gs[1])
+            if dist < self.downlink_range_km:
                 return True
         return False
+
+    def _ground_distance_km(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        lat1_rad = np.radians(lat1)
+        lon1_rad = np.radians(lon1)
+        lat2_rad = np.radians(lat2)
+        lon2_rad = np.radians(lon2)
+
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+        hav = (
+            np.sin(dlat / 2) ** 2
+            + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2) ** 2
+        )
+        central_angle = 2 * np.arctan2(np.sqrt(hav), np.sqrt(1 - hav))
+        return float(self.earth_radius_km * central_angle)

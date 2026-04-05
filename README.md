@@ -134,6 +134,20 @@ observation, reward, done, info = env.step(action)
 state = env.state()
 ```
 
+## Dashboard
+
+Launch the local simulation dashboard with:
+
+```bash
+python dashboard.py
+```
+
+This opens a Gradio interface where you can:
+- Reset to the easy, medium, or hard task
+- Run one or many environment steps
+- Switch between heuristic, random, and manual action selection
+- Monitor satellite battery, storage, latest actions, rewards, and orbit positions
+
 ## Baseline Scores
 
 Run the baseline inference script to get reproducible scores (using Groq):
