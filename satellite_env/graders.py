@@ -14,10 +14,10 @@ class TaskGrader:
         max_score = len(criteria)
 
         # Count images captured (from actions)
-        images_captured = sum(1 for action in actions for act in action.satellite_actions if act == 'capture')
+        images_captured = sum(1 for action in actions for act in action.satellite_actions.values() if act == 'capture')
 
         # Count data downlinked (from actions)
-        data_downlinked = sum(1 for action in actions for act in action.satellite_actions if act == 'downlink')
+        data_downlinked = sum(1 for action in actions for act in action.satellite_actions.values() if act == 'downlink')
 
         # Final battery levels
         final_batteries = [s['battery'] for s in final_state['satellites']]

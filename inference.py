@@ -1,306 +1,342 @@
-#!/usr/bin/env python3
 """
-Inference Script for Satellite Constellation Management Environment
-===================================================================
+Inference Script Example for Satellite Environment
+===================================================
 MANDATORY
 - Before submitting, ensure the following variables are defined in your environment configuration:
     API_BASE_URL   The API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
     HF_TOKEN       Your Hugging Face / API key.
-
+    
 - The inference script must be named `inference.py` and placed in the root directory of the project
 - Participants must use OpenAI Client for all LLM calls using above variables
 """
 
 import os
 import re
+import time
 import textwrap
-from typing import List, Dict, Any
+from typing import List, Optional, Dict, Any
 
-import json
-import requests
 from dotenv import load_dotenv
+from openai import OpenAI
 
-from satellite_env import SatelliteConstellationEnv, Action, EasyTask, MediumTask, HardTask
+from satellite.server.satellite_environment import SatelliteEnvironment
+from satellite.models import SatelliteAction
 
+# Load environment variables from .env file
 load_dotenv()
 
-# Groq configuration
-GROQ_API_URL = os.getenv("GROQ_API_URL") or os.getenv("API_BASE_URL") or os.getenv("GROQ_API_BASE")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME") or os.getenv("GROQ_MODEL") or "groq-1"
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+MODEL_NAME = os.getenv("MODEL_NAME")
 MAX_STEPS = 50
 TEMPERATURE = 0.2
 MAX_TOKENS = 300
-FALLBACK_ACTION = {"satellite_actions": {}}
+FALLBACK_ACTION = "idle"
+
+# Rate limiting - Add delay between API requests (in seconds)
+# Increase this value to slow down requests and reduce API usage
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))  # Default 2 seconds between requests
+
+# FREE ALTERNATIVE MODELS (if you run out of credits):
+# 
+# Option 1: Ollama (FREE - runs locally on your machine)
+#   https://ollama.ai
+#   Command: ollama pull mistral
+#   Setup:
+#     API_BASE_URL="http://localhost:11434/v1"
+#     MODEL_NAME="mistral"
+#   Start server: ollama serve
+#
+# Option 2: Groq (FREE tier - very fast, 25 requests/min limit)
+#   https://console.groq.com
+#   Setup:
+#     API_BASE_URL="https://api.groq.com/openai/v1"
+#     HF_TOKEN=<your_groq_api_key>
+#     MODEL_NAME="mixtral-8x7b-32768"
+#
+# Option 3: Together AI (FREE tier)
+#   https://api.together.xyz
+#   Setup similar to above
+#
+# To use: Update .env file with the appropriate values
 
 DEBUG = True
+ACTION_PATTERN = re.compile(r"(capture|downlink|maintain|idle)", re.IGNORECASE)
+
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You are managing a satellite constellation with limited resources.
-    Your goal is to maximize mission value by making optimal decisions for each satellite.
-
-    Available actions per satellite: 'capture', 'downlink', 'maintain', 'idle'
-    - 'capture': Take an image (costs battery, fills storage)
-    - 'downlink': Send data to ground station (if in range, costs battery, frees storage)
-    - 'maintain': Perform maintenance (recharges battery)
-    - 'idle': No action
-
-    Reply with a JSON object containing 'satellite_actions' as a dict of satellite_id -> action.
-    Example: {"satellite_actions": {"0": "capture", "1": "downlink", "2": "maintain"}}
-
-    Consider battery levels, storage usage, and communication opportunities.
-    Do not include explanations or additional text.
+    You are an intelligent satellite constellation manager.
+    You control a constellation of satellites with the following capabilities:
+    - capture: Take images (uses battery, increases storage)
+    - downlink: Send data to ground station (uses battery, decreases storage)
+    - maintain: Recharge battery (restores battery level)
+    - idle: Do nothing (passive energy recovery)
+    
+    For each satellite, decide which action to take based on:
+    - Battery level (critical: < 20%, warning: < 50%)
+    - Storage level (full: > 90%, empty: < 10%)
+    - Task priorities and weather conditions
+    - Ground station availability
+    
+    Respond with a JSON dict mapping satellite_id to action.
+    Example: {"0": "capture", "1": "downlink", "2": "maintain"}
     """
 ).strip()
 
 
-def build_satellite_status(observation) -> str:
-    """Build a readable status of all satellites."""
-    status_lines = []
-    for sat in observation.satellites:
-        status_lines.append(
-            f"  Satellite {sat.id}: pos=({sat.position[0]:.1f}, {sat.position[1]:.1f}, {sat.position[2]:.1f}), "
-            f"battery={sat.battery:.1f}%, storage={sat.storage:.1f}%, last_action={sat.last_action}"
+def build_history_lines(history: List[str]) -> str:
+    if not history:
+        return "None"
+    return "\n".join(history[-6:])
+
+
+def format_observation(observation: Dict[str, Any]) -> str:
+    """Format observation for LLM context."""
+    satellites_info = []
+    for sat in observation.get("satellites", []):
+        sat_str = (
+            f"  Satellite {sat['id']}: "
+            f"Battery={sat['battery']:.1f}%, "
+            f"Storage={sat['storage']:.1f}%, "
+            f"LastAction={sat['last_action']}"
         )
-    return "\n".join(status_lines)
+        satellites_info.append(sat_str)
+
+    weather_info = ", ".join(
+        f"{region}: {cover:.0%} cloud cover"
+        for region, cover in observation.get("weather_conditions", {}).items()
+    )
+
+    tasks_info = "\n  ".join(
+        f"{task['type']} (priority: {task.get('priority', 'unknown')})"
+        for task in observation.get("pending_tasks", [])[:3]
+    )
+
+    return f"""
+Satellites:
+{chr(10).join(satellites_info)}
+
+Weather: {weather_info}
+
+Pending Tasks (top 3):
+  {tasks_info or 'None'}
+
+Time Step: {observation.get('time_step', 0)} / 100
+Total Reward: {observation.get('total_reward', 0):.1f}
+"""
 
 
-def build_ground_stations_status(observation) -> str:
-    """Build status of ground stations."""
-    if not observation.ground_stations:
-        return "No ground stations available"
-    stations = [f"({lat:.1f}, {lon:.1f})" for lat, lon in observation.ground_stations]
-    return f"Ground stations: {', '.join(stations)}"
-
-
-def build_weather_status(observation) -> str:
-    """Build weather conditions status."""
-    if not observation.weather_conditions:
-        return "Weather: Clear"
-    conditions = [f"{region}: {cover:.2f}" for region, cover in observation.weather_conditions.items()]
-    return f"Weather conditions: {', '.join(conditions)}"
-
-
-def build_tasks_status(observation) -> str:
-    """Build pending tasks status."""
-    if not observation.pending_tasks:
-        return "No pending tasks"
-    tasks = [f"{task.get('type', 'unknown')} in {task.get('region', 'unknown')}" for task in observation.pending_tasks]
-    return f"Pending tasks: {', '.join(tasks)}"
-
-
-def build_user_prompt(step: int, observation, history: List[str], task_description: str) -> str:
-    """Build the user prompt for the model."""
-
-    satellite_status = build_satellite_status(observation)
-    ground_stations = build_ground_stations_status(observation)
-    weather = build_weather_status(observation)
-    tasks = build_tasks_status(observation)
-
-    history_text = "\n".join(history[-3:]) if history else "None"
-
+def build_user_prompt(
+    step: int, observation: Dict[str, Any], history: List[str], reward: float
+) -> str:
     prompt = textwrap.dedent(
         f"""
         Step: {step}
-        Mission Goal: {task_description}
-
-        Current Status:
-        {satellite_status}
-        {ground_stations}
-        {weather}
-        {tasks}
-
-        Previous actions:
-        {history_text}
-
-        Reply with a JSON object containing satellite_actions as a dict of satellite_id -> action.
-        Available actions: 'capture', 'downlink', 'maintain', 'idle'
+        Last Reward: {reward:+.2f}
+        
+        Current State:
+        {format_observation(observation)}
+        
+        Action History (last 6 steps):
+        {build_history_lines(history)}
+        
+        Decide actions for all satellites. Respond with JSON dict only.
         """
     ).strip()
     return prompt
 
 
-def parse_model_action(response_text: str, num_satellites: int) -> Dict[str, Any]:
-    """Parse the model's response into an Action object."""
-    if not response_text:
-        return FALLBACK_ACTION
+def parse_model_action(response_text: str) -> Dict[int, str]:
+    """Parse LLM response to extract satellite actions."""
+    satellite_actions = {}
 
+    if not response_text:
+        satellite_actions[0] = FALLBACK_ACTION
+        return satellite_actions
+
+    # Try to parse JSON dict
     try:
-        # Try to parse as JSON
-        result = json.loads(response_text.strip())
-        if "satellite_actions" in result:
-            # Validate that we have actions for satellites that exist
-            actions = {}
-            for sat_id in range(num_satellites):
-                sat_id_str = str(sat_id)
-                if sat_id_str in result["satellite_actions"]:
-                    action = result["satellite_actions"][sat_id_str]
-                    if action in ['capture', 'downlink', 'maintain', 'idle']:
-                        actions[sat_id] = action
-                    else:
-                        actions[sat_id] = 'idle'  # fallback
+        import json
+
+        # Extract JSON from response
+        json_match = re.search(r"\{[^{}]*\}", response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            parsed = json.loads(json_str)
+
+            # Convert string keys to int and validate actions
+            valid_actions = {"capture", "downlink", "maintain", "idle"}
+            for key, action in parsed.items():
+                sat_id = int(key) if isinstance(key, str) else key
+                action_str = str(action).lower().strip()
+                if action_str in valid_actions:
+                    satellite_actions[sat_id] = action_str
                 else:
-                    actions[sat_id] = 'idle'  # default
-            return {"satellite_actions": actions}
-    except json.JSONDecodeError:
+                    satellite_actions[sat_id] = FALLBACK_ACTION
+
+            if satellite_actions:
+                return satellite_actions
+    except (json.JSONDecodeError, ValueError, TypeError):
         pass
 
-    # Fallback: try to extract JSON from text
-    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-    if json_match:
-        try:
-            result = json.loads(json_match.group(0))
-            if "satellite_actions" in result:
-                return result
-        except json.JSONDecodeError:
-            pass
+    # Fallback: extract individual actions
+    lines = response_text.splitlines()
+    for line in lines:
+        match = ACTION_PATTERN.search(line)
+        if match:
+            action = match.group(1).lower()
+            satellite_actions[len(satellite_actions)] = action
 
-    # Final fallback
-    return FALLBACK_ACTION
+    # If no actions found, default to idle
+    if not satellite_actions:
+        satellite_actions[0] = FALLBACK_ACTION
 
-
-def run_inference(task_name: str = "easy") -> Dict[str, Any]:
-    """Run inference on the specified task."""
-
-    # Initialize Groq client (HTTP)
-    if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY or API_KEY environment variable not set")
-
-    if not GROQ_API_URL:
-        GROQ_API_URL = f"https://api.groq.ai/v1/models/{MODEL_NAME}/completions"
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # Set up task
-    if task_name == "easy":
-        task = EasyTask()
-    elif task_name == "medium":
-        task = MediumTask()
-    elif task_name == "hard":
-        task = HardTask()
-    else:
-        raise ValueError(f"Unknown task: {task_name}")
-
-    # Initialize environment
-    env = SatelliteConstellationEnv()
-    task.setup_environment(env)
-
-    history: List[str] = []
-    total_reward = 0.0
-
-    try:
-        # Reset environment
-        observation = env.reset()
-        print(f"Starting {task_name} task: {task.description}")
-
-        for step in range(1, MAX_STEPS + 1):
-            # Build prompt
-            user_prompt = build_user_prompt(step, observation, history, task.description)
-
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
-            ]
-
-            try:
-                payload = {
-                    "prompt": SYSTEM_PROMPT + "\n" + user_prompt,
-                    "max_tokens": MAX_TOKENS,
-                    "temperature": TEMPERATURE,
-                }
-                resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
-                resp.raise_for_status()
-                body = resp.json()
-                # extract text
-                response_text = ""
-                if isinstance(body, dict):
-                    if "choices" in body and len(body["choices"]) > 0:
-                        first = body["choices"][0]
-                        response_text = first.get("text") or first.get("message", {}).get("content", "")
-                    elif "output" in body:
-                        out = body["output"]
-                        response_text = out[0] if isinstance(out, list) and len(out) > 0 else (out if isinstance(out, str) else "")
-                if not response_text:
-                    response_text = json.dumps(body)
-            except Exception as exc:
-                print(f"Model request failed ({exc}). Using fallback action.")
-                response_text = json.dumps(FALLBACK_ACTION)
-
-            # Parse action
-            action_dict = parse_model_action(response_text, env.num_satellites)
-            action = Action(**action_dict)
-
-            if DEBUG:
-                print(f"Step {step}: {action_dict}")
-
-            # Step environment
-            observation, reward, done, info = env.step(action)
-
-            total_reward += reward.value
-
-            # Record history
-            history_line = f"Step {step}: {action_dict} -> reward {reward.value:.2f}"
-            history.append(history_line)
-
-            if done:
-                print(f"Episode complete at step {step}. Total reward: {total_reward:.2f}")
-                break
-
-        else:
-            print(f"Reached max steps ({MAX_STEPS}). Total reward: {total_reward:.2f}")
-
-    except Exception as e:
-        print(f"Error during inference: {e}")
-        return {"error": str(e), "score": 0.0}
-
-    # Return results
-    final_state = env.state()
-    return {
-        "task": task_name,
-        "total_reward": total_reward,
-        "steps": len(history),
-        "final_battery_avg": sum(s['battery'] for s in final_state['satellites']) / len(final_state['satellites']),
-        "history": history
-    }
+    return satellite_actions
 
 
 def main() -> None:
-    """Main function to run inference on all tasks."""
+    """Run satellite environment inference with LLM agent."""
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    if not all([GROQ_API_URL, GROQ_API_KEY, MODEL_NAME]):
-        print("Error: Missing required environment variables:")
-        print("  GROQ_API_URL (or API_BASE_URL), GROQ_API_KEY (or API_KEY/HF_TOKEN), MODEL_NAME")
-        return
+    env = SatelliteEnvironment(num_satellites=5, max_steps=100)
 
-    tasks = ["easy", "medium", "hard"]
-    results = {}
+    history: List[str] = []
+    total_episode_reward = 0.0
 
-    for task_name in tasks:
+    try:
+        observation = env.reset()
+        obs_dict = {
+            "satellites": [
+                {
+                    "id": sat.id,
+                    "position": sat.position,
+                    "battery": sat.battery,
+                    "storage": sat.storage,
+                    "last_action": sat.last_action,
+                }
+                for sat in observation.satellites
+            ],
+            "time_step": observation.time_step,
+            "ground_stations": observation.ground_stations,
+            "weather_conditions": observation.weather_conditions,
+            "pending_tasks": observation.pending_tasks,
+            "total_reward": observation.total_reward,
+        }
+
+        print(f"Episode started with {len(observation.satellites)} satellites")
+        print(f"Goal: Maximize reward through optimal satellite management\n")
+
+        for step in range(1, MAX_STEPS + 1):
+            if observation.done:
+                print("Environment signalled done. Stopping early.")
+                break
+
+            user_prompt = build_user_prompt(step, obs_dict, history, total_episode_reward)
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ]
+
+            try:
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                    stream=False,
+                )
+                response_text = completion.choices[0].message.content or ""
+                if DEBUG:
+                    print(f"[Model Response] {response_text[:100]}...")
+                # Add delay between requests to reduce API usage
+                if step < MAX_STEPS:  # Don't delay after last step
+                    time.sleep(REQUEST_DELAY)
+            except Exception as exc:  # pylint: disable=broad-except
+                failure_msg = f"Model request failed ({exc}). Using fallback action."
+                print(failure_msg)
+                print("\n💡 To fix this issue:")
+                print("   1. INCREASE REQUEST_DELAY in .env file:")
+                print("      REQUEST_DELAY=5  # Wait 5 seconds between requests")
+                print("   2. OR use a FREE model alternative:")
+                print("      a) Ollama (local): ollama pull mistral")
+                print("         Then set: API_BASE_URL=http://localhost:11434/v1")
+                print("      b) Groq (free/fast): Get API key at https://console.groq.com")
+                print("         Then set: API_BASE_URL=https://api.groq.com/openai/v1")
+                print("      c) Together AI: Get API key at https://api.together.xyz")
+                print()
+                response_text = FALLBACK_ACTION
+
+            # Parse actions from response
+            satellite_actions = parse_model_action(response_text)
+
+            # Convert to correct format for environment
+            action_dict = {int(k): v for k, v in satellite_actions.items()}
+
+            print(f"\nStep {step}:")
+            print(f"  Actions: {action_dict}")
+
+            # Execute action
+            action = SatelliteAction(satellite_actions=action_dict)
+            observation = env.step(action)
+
+            # Convert observation for display
+            obs_dict = {
+                "satellites": [
+                    {
+                        "id": sat.id,
+                        "position": sat.position,
+                        "battery": sat.battery,
+                        "storage": sat.storage,
+                        "last_action": sat.last_action,
+                    }
+                    for sat in observation.satellites
+                ],
+                "time_step": observation.time_step,
+                "ground_stations": observation.ground_stations,
+                "weather_conditions": observation.weather_conditions,
+                "pending_tasks": observation.pending_tasks,
+                "total_reward": observation.total_reward,
+            }
+
+            step_reward = observation.reward or 0.0
+            total_episode_reward += step_reward
+
+            history_line = f"Step {step}: {action_dict} → reward {step_reward:+.2f}"
+            history.append(history_line)
+
+            print(f"  Reward: {step_reward:+.2f} | Total: {total_episode_reward:+.2f}")
+            print(f"  Done: {observation.done}")
+
+            if observation.done:
+                print("\nEpisode complete.")
+                break
+
+        else:
+            print(f"\nReached max steps ({MAX_STEPS}).")
+
         print(f"\n{'='*50}")
-        print(f"Running {task_name} task...")
+        print(f"Episode Summary:")
+        print(f"  Total Reward: {total_episode_reward:.2f}")
+        print(f"  Final Step: {obs_dict['time_step']}")
+        print(f"  Satellites: {len(obs_dict['satellites'])}")
+        for sat in obs_dict["satellites"]:
+            print(
+                f"    Satellite {sat['id']}: "
+                f"Battery={sat['battery']:.1f}%, Storage={sat['storage']:.1f}%"
+            )
         print(f"{'='*50}")
 
-        result = run_inference(task_name)
-        results[task_name] = result
-
-        if "error" not in result:
-            print(f"Completed {task_name}: {result['total_reward']:.2f} reward, {result['steps']} steps")
-        else:
-            print(f"Failed {task_name}: {result['error']}")
-
-    # Save results
-    with open("inference_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"\n{'='*50}")
-    print("INFERENCE COMPLETE")
-    print("Results saved to inference_results.json")
-    print(f"{'='*50}")
+    finally:
+        print("\nClosing environment...")
 
 
 if __name__ == "__main__":

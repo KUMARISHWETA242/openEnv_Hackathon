@@ -1,16 +1,14 @@
-from typing import List, Dict, Any, Tuple, Literal
-from pydantic import BaseModel, validator
+from typing import List, Dict, Any, Tuple
+from pydantic import BaseModel
 import numpy as np
 from dataclasses import dataclass
-
-SatelliteActionName = Literal['capture', 'downlink', 'maintain', 'idle']
 
 class SatelliteState(BaseModel):
     id: int
     position: Tuple[float, float, float]  # x, y, z in orbit
     battery: float  # 0-100
     storage: float  # 0-100 (percentage used)
-    last_action: SatelliteActionName
+    last_action: str
 
 class Observation(BaseModel):
     satellites: List[SatelliteState]
@@ -20,22 +18,7 @@ class Observation(BaseModel):
     pending_tasks: List[Dict[str, Any]]  # tasks to be assigned
 
 class Action(BaseModel):
-    satellite_actions: List[SatelliteActionName]
-
-    @validator('satellite_actions', pre=True)
-    def normalize_satellite_actions(cls, value):
-        if isinstance(value, dict):
-            if not value:
-                return []
-
-            normalized = {}
-            for sat_id, action in value.items():
-                normalized[int(sat_id)] = action
-
-            max_satellite_id = max(normalized)
-            return [normalized.get(sat_id, 'idle') for sat_id in range(max_satellite_id + 1)]
-
-        return value
+    satellite_actions: Dict[int, str]  # satellite_id -> action ('capture', 'downlink', 'maintain', 'idle')
 
 class Reward(BaseModel):
     value: float
@@ -80,7 +63,7 @@ class SatelliteConstellationEnv:
         reward_value = 0.0
         reward_components = {}
 
-        for sat_id, act in enumerate(action.satellite_actions):
+        for sat_id, act in action.satellite_actions.items():
             if sat_id >= len(self.satellites):
                 continue
             sat = self.satellites[sat_id]
