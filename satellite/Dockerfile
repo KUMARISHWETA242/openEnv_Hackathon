@@ -1,7 +1,9 @@
 # Hugging Face Space and local Docker entrypoint for the satellite environment.
 #
-# Build context should be the satellite/ directory:
-#   docker build -t satellite-openenv ./satellite
+# Build context can be the repository root or the satellite/ directory.
+# Use COPY . so the Dockerfile works whether the build context is the
+# repository root (it will then include the `satellite/` contents under the
+# context) or when the build context is already `satellite/`.
 
 ARG BASE_IMAGE=ghcr.io/meta-pytorch/openenv-base:latest
 FROM ${BASE_IMAGE} AS builder

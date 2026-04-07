@@ -6,6 +6,8 @@
 
 """OpenEnv-facing wrapper around the canonical satellite task environment."""
 
+from __future__ import annotations
+
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -21,12 +23,61 @@ except Exception:  # pragma: no cover - local fallback when openenv is absent
         episode_id: str = Field(default_factory=lambda: str(uuid4()))
         step_count: int = 0
 
+import importlib
+
+# Prefer absolute imports when this package is placed on PYTHONPATH as a
+# flat layout (e.g., /app/env is on PYTHONPATH in the Docker image).
+SatelliteTaskEnv = None
+SatelliteAction = None
+SatelliteObservation = None
+
 try:
-    from ..env import SatelliteTaskEnv
-    from ..models import SatelliteAction, SatelliteObservation
-except ImportError:
     from env import SatelliteTaskEnv
     from models import SatelliteAction, SatelliteObservation
+except Exception:
+    # Try named package imports (e.g., when installed as `satellite` or `env`).
+    for pkg in ("satellite", "env"):
+        try:
+            mod_env = importlib.import_module(f"{pkg}.env")
+            mod_models = importlib.import_module(f"{pkg}.models")
+            SatelliteTaskEnv = getattr(mod_env, "SatelliteTaskEnv")
+            SatelliteAction = getattr(mod_models, "SatelliteAction")
+            SatelliteObservation = getattr(mod_models, "SatelliteObservation")
+            break
+        except Exception:
+            continue
+
+    if SatelliteTaskEnv is None:
+        # Last resort: load the sibling files directly from disk.
+        try:
+            import importlib.util
+            from pathlib import Path
+
+            here = Path(__file__).resolve().parent
+            pkg_root = here.parent
+            env_path = pkg_root / "env.py"
+            models_path = pkg_root / "models.py"
+
+            if env_path.exists() and models_path.exists():
+                spec_env = importlib.util.spec_from_file_location(
+                    "satellite_env_fallback", str(env_path)
+                )
+                mod_env = importlib.util.module_from_spec(spec_env)  # type: ignore[arg-type]
+                spec_env.loader.exec_module(mod_env)  # type: ignore[attr-defined]
+
+                spec_models = importlib.util.spec_from_file_location(
+                    "satellite_models_fallback", str(models_path)
+                )
+                mod_models = importlib.util.module_from_spec(spec_models)  # type: ignore[arg-type]
+                spec_models.loader.exec_module(mod_models)  # type: ignore[attr-defined]
+
+                SatelliteTaskEnv = getattr(mod_env, "SatelliteTaskEnv")
+                SatelliteAction = getattr(mod_models, "SatelliteAction")
+                SatelliteObservation = getattr(mod_models, "SatelliteObservation")
+            else:
+                raise
+        except Exception:
+            raise
 
 
 class SatelliteEnvironment(Environment):
@@ -69,7 +120,7 @@ class SatelliteEnvironment(Environment):
         )
         self._state = State(episode_id=str(uuid4()), step_count=0)
 
-    def reset(self) -> SatelliteObservation:
+    def reset(self) -> "SatelliteObservation":
         """
         Reset the environment to initial state.
 
@@ -82,7 +133,7 @@ class SatelliteEnvironment(Environment):
         self._state.step_count = 0
         return observation
 
-    def step(self, action: SatelliteAction) -> SatelliteObservation:  # type: ignore[override]
+    def step(self, action: "SatelliteAction") -> "SatelliteObservation":  # type: ignore[override]
         """
         Execute one step in the environment.
 

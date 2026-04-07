@@ -35,12 +35,65 @@ except Exception as e:  # pragma: no cover
         "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
     ) from e
 
+import importlib
+
+# 1) Try absolute imports first (this handles the Docker layout where /app/env
+#    is on PYTHONPATH and modules like `models` and `server` are top-level).
 try:
-    from ..models import SatelliteAction, SatelliteObservation
-    from .satellite_environment import SatelliteEnvironment
-except ModuleNotFoundError:
     from models import SatelliteAction, SatelliteObservation
     from server.satellite_environment import SatelliteEnvironment
+except Exception:  # pragma: no cover - tolerate multiple packaging layouts
+    # 2) Try package-relative imports (when running as `satellite.server.app`).
+    try:
+        from ..models import SatelliteAction, SatelliteObservation
+        from .satellite_environment import SatelliteEnvironment
+    except Exception:
+        # 3) Try common installed package names (e.g., `satellite` or `env`).
+        SatelliteAction = None
+        SatelliteObservation = None
+        SatelliteEnvironment = None
+        for pkg in ("satellite", "env"):
+            try:
+                mod_models = importlib.import_module(f"{pkg}.models")
+                mod_server_env = importlib.import_module(f"{pkg}.server.satellite_environment")
+                SatelliteAction = getattr(mod_models, "SatelliteAction")
+                SatelliteObservation = getattr(mod_models, "SatelliteObservation")
+                SatelliteEnvironment = getattr(mod_server_env, "SatelliteEnvironment")
+                break
+            except Exception:
+                continue
+
+        if SatelliteAction is None:
+            # 4) Last resort: file-based fallback (load sibling files directly).
+            try:
+                import importlib.util
+                from pathlib import Path
+
+                here = Path(__file__).resolve().parent
+                pkg_root = here.parent
+                models_path = pkg_root / "models.py"
+                server_env_path = here / "satellite_environment.py"
+
+                if models_path.exists() and server_env_path.exists():
+                    spec_models = importlib.util.spec_from_file_location(
+                        "satellite_models_fallback", str(models_path)
+                    )
+                    mod_models = importlib.util.module_from_spec(spec_models)  # type: ignore[arg-type]
+                    spec_models.loader.exec_module(mod_models)  # type: ignore[attr-defined]
+
+                    spec_server_env = importlib.util.spec_from_file_location(
+                        "satellite_server_env_fallback", str(server_env_path)
+                    )
+                    mod_server_env = importlib.util.module_from_spec(spec_server_env)  # type: ignore[arg-type]
+                    spec_server_env.loader.exec_module(mod_server_env)  # type: ignore[attr-defined]
+
+                    SatelliteAction = getattr(mod_models, "SatelliteAction")
+                    SatelliteObservation = getattr(mod_models, "SatelliteObservation")
+                    SatelliteEnvironment = getattr(mod_server_env, "SatelliteEnvironment")
+                else:
+                    raise
+            except Exception:
+                raise
 
 
 # Create the app with web interface and README integration

@@ -1,33 +1,39 @@
-"""Baseline inference runner for all satellite tasks."""
+"""
+Inference Script Example
+===================================
+MANDATORY
+- Before submitting, ensure the following variables are defined in your environment configuration:
+    API_BASE_URL   The API endpoint for the LLM.
+    MODEL_NAME     The model identifier to use for inference.
+    HF_TOKEN       Your Hugging Face / API key.
 
+- The inference script must be named `inference.py` and placed in the root directory of the project
+- Participants must use OpenAI Client for all LLM calls using above variables
+"""
+
+import asyncio
 import json
 import os
 import re
 import textwrap
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
 from openai import OpenAI
 
-from satellite import (
-    EasyTask,
-    HardTask,
-    MediumTask,
-    SatelliteAction,
-    SatelliteTaskEnv,
-    TaskGrader,
-)
-
+from satellite import EasyTask, HardTask, MediumTask, SatelliteAction, TaskGrader
+from satellite.client import SatelliteEnv
+from dotenv import load_dotenv
 load_dotenv()
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-HF_TOKEN = os.getenv("HF_TOKEN")
+API_BASE_URL = os.getenv("API_BASE_URL")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME")
+ENV_IMAGE = os.getenv("ENV_IMAGE", "satellite-openenv:latest")
 BASELINE_POLICY = os.getenv("BASELINE_POLICY", "openai").lower()
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "350"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "300"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.0"))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 FALLBACK_ACTION = "idle"
@@ -39,25 +45,29 @@ TASK_TYPES = {
 }
 
 ACTION_PATTERN = re.compile(r"(capture|downlink|maintain|idle)", re.IGNORECASE)
+ACTION_PREFIX_RE = re.compile(r"^(action|next action)\s*[:\-]\s*", re.IGNORECASE)
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
     You are managing a real-world satellite constellation.
-    Your objective is to complete visible tasks while preserving battery and storage health.
+    Reply with exactly one JSON object mapping satellite ids to actions.
 
-    Available actions per satellite:
+    Valid actions:
     - capture
     - downlink
     - maintain
     - idle
 
-    Rules of thumb:
-    - prioritize capture when image tasks remain and the satellite has battery and storage headroom
-    - prioritize downlink when storage is high or downlink tasks remain
-    - maintain when battery is low
-    - avoid repeated wasteful actions and invalid moves
+    Rules:
+    - prioritize image capture when image tasks remain and the satellite has enough battery/storage
+    - prioritize downlink when storage is high or data-downlink tasks remain
+    - use maintain when battery is low
+    - avoid repeated wasteful actions, invalid moves, and risky resource depletion
 
-    Respond with JSON only in the form {"0": "capture", "1": "idle"}.
+    Output format:
+    {"0": "capture", "1": "idle"}
+
+    Do not include explanations or any extra text outside the JSON object.
     """
 ).strip()
 
@@ -82,11 +92,12 @@ def format_observation(task_name: str, observation: Dict[str, Any]) -> str:
     satellites_info = []
     for sat in observation.get("satellites", []):
         satellites_info.append(
-            f"  Satellite {sat['id']}: battery={sat['battery']:.1f}, storage={sat['storage']:.1f}, last={sat['last_action']}"
+            f"  Satellite {sat['id']}: battery={sat['battery']:.1f}, "
+            f"storage={sat['storage']:.1f}, last={sat['last_action']}"
         )
 
     tasks_info = []
-    for task in observation.get("pending_tasks", [])[:6]:
+    for task in observation.get("pending_tasks", [])[:8]:
         descriptor = task["type"]
         if task["type"] == "image_capture":
             descriptor += f" region={task.get('region')}"
@@ -108,7 +119,7 @@ def format_observation(task_name: str, observation: Dict[str, Any]) -> str:
         Weather: {weather_info or 'n/a'}
 
         Satellites:
-        {chr(10).join(satellites_info)}
+        {chr(10).join(satellites_info) or '  None'}
 
         Pending Tasks:
         {chr(10).join(tasks_info) or '  - None'}
@@ -131,23 +142,28 @@ def build_user_prompt(
         Current state:
         {format_observation(task_name, observation)}
 
-        Recent action history:
+        Previous steps:
         {build_history_lines(history)}
 
-        Return JSON only.
+        Reply with exactly one JSON object.
         """
     ).strip()
 
 
 def heuristic_action(observation: Dict[str, Any]) -> Dict[int, str]:
     actions: Dict[int, str] = {}
-    has_capture_task = any(task["type"] == "image_capture" for task in observation["pending_tasks"])
-    has_downlink_task = any(task["type"] == "data_downlink" for task in observation["pending_tasks"])
+    has_capture_task = any(
+        task["type"] == "image_capture" for task in observation["pending_tasks"]
+    )
+    has_downlink_task = any(
+        task["type"] == "data_downlink" for task in observation["pending_tasks"]
+    )
 
     for sat in observation["satellites"]:
         sat_id = sat["id"]
         battery = sat["battery"]
         storage = sat["storage"]
+
         if battery < 20:
             actions[sat_id] = "maintain"
         elif storage > 60 and has_downlink_task:
@@ -160,6 +176,7 @@ def heuristic_action(observation: Dict[str, Any]) -> Dict[int, str]:
             actions[sat_id] = "maintain"
         else:
             actions[sat_id] = "idle"
+
     return actions
 
 
@@ -167,30 +184,32 @@ def parse_model_action(response_text: str, observation: Dict[str, Any]) -> Dict[
     if not response_text:
         return heuristic_action(observation)
 
+    cleaned = ACTION_PREFIX_RE.sub("", response_text.strip())
+
     try:
-        json_match = re.search(r"\{[^{}]*\}", response_text, re.DOTALL)
+        json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if json_match:
             parsed = json.loads(json_match.group(0))
             actions: Dict[int, str] = {}
             for key, value in parsed.items():
                 action = str(value).strip().lower()
-                if action not in {"capture", "downlink", "maintain", "idle"}:
+                if not ACTION_PATTERN.fullmatch(action):
                     action = FALLBACK_ACTION
                 actions[int(key)] = action
             if actions:
                 return actions
-    except (json.JSONDecodeError, ValueError, TypeError):
+    except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
     extracted: Dict[int, str] = {}
-    for line in response_text.splitlines():
+    for line in cleaned.splitlines():
         match = ACTION_PATTERN.search(line)
         if match:
             extracted[len(extracted)] = match.group(1).lower()
     return extracted or heuristic_action(observation)
 
 
-def observation_to_dict(observation) -> Dict[str, Any]:
+def observation_to_dict(observation: Any) -> Dict[str, Any]:
     return {
         "satellites": [
             {
@@ -210,83 +229,140 @@ def observation_to_dict(observation) -> Dict[str, Any]:
     }
 
 
-def build_client() -> OpenAI | None:
+def build_client() -> Optional[OpenAI]:
     if BASELINE_POLICY == "heuristic":
         return None
-    if not HF_TOKEN:
-        raise RuntimeError("HF_TOKEN is required for inference.")
+
+    missing = []
+    if not API_BASE_URL:
+        missing.append("API_BASE_URL")
     if not MODEL_NAME:
-        raise RuntimeError("MODEL_NAME is required for inference.")
-    return OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+        missing.append("MODEL_NAME")
+    if not API_KEY:
+        missing.append("HF_TOKEN")
+
+    if missing:
+        raise RuntimeError(
+            f"Missing required environment variables: {', '.join(missing)}."
+        )
+
+    return OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
 
 def choose_actions(
-    client: OpenAI | None,
+    client: Optional[OpenAI],
     task_name: str,
     step: int,
     observation: Dict[str, Any],
     history: List[str],
     total_reward: float,
 ) -> Dict[int, str]:
-    prompt = build_user_prompt(task_name, step, observation, history, total_reward)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ]
-
     if client is None:
         return heuristic_action(observation)
 
+    user_prompt = build_user_prompt(task_name, step, observation, history, total_reward)
     completion = client.chat.completions.create(
         model=MODEL_NAME,
-        messages=messages,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
         temperature=TEMPERATURE,
         max_tokens=MAX_TOKENS,
         stream=False,
     )
     response_text = completion.choices[0].message.content or ""
     if DEBUG:
-        print(f"[{task_name}] model response: {response_text[:200]}")
+        print(f"[{task_name}] model response: {response_text[:300]}")
     return parse_model_action(response_text, observation)
 
 
-def run_task(task_name: str, client: OpenAI | None) -> TaskRunResult:
-    env = SatelliteTaskEnv(task_name=task_name)
+async def run_task(task_name: str, client: Optional[OpenAI]) -> TaskRunResult:
+    env = await SatelliteEnv.from_docker_image(
+        image=ENV_IMAGE,
+        env_vars={"OPENENV_TASK_NAME": task_name},
+    )
     task = TASK_TYPES[task_name]()
     grader = TaskGrader(task)
-    observation = env.reset()
-    total_reward = 0.0
     history: List[str] = []
-    step_limit = env.state().max_steps
+    total_reward = 0.0
 
-    for step in range(1, step_limit + 1):
-        obs_dict = observation_to_dict(observation)
-        try:
-            actions = choose_actions(client, task_name, step, obs_dict, history, total_reward)
-        except Exception as exc:  # pragma: no cover - API failure fallback
-            print(f"[{task_name}] request failed ({exc}); using deterministic heuristic fallback.")
-            actions = heuristic_action(obs_dict)
+    try:
+        reset_result = await env.reset()
+        observation = reset_result.observation
+        state = await env.state()
+        step_limit = getattr(state, "max_steps", None) or {"easy": 50, "medium": 100, "hard": 200}[task_name]
 
-        action = SatelliteAction(satellite_actions=actions)
-        observation, reward, done, _ = env.step(action)
-        total_reward += reward.value
-        history.append(f"step {step}: {actions} -> {reward.value:+.2f}")
+        print(f"\nRunning task: {task_name} on image {ENV_IMAGE}")
 
-        if REQUEST_DELAY > 0 and step < step_limit and not done:
-            time.sleep(REQUEST_DELAY)
-        if done:
-            break
+        for step in range(1, step_limit + 1):
+            obs_dict = observation_to_dict(observation)
+            try:
+                actions = choose_actions(
+                    client, task_name, step, obs_dict, history, total_reward
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{task_name}] Model request failed ({exc}). Using heuristic fallback.")
+                actions = heuristic_action(obs_dict)
 
-    state = env.state()
-    score = grader.grade_episode(env)
-    return TaskRunResult(
-        task_name=task_name,
-        score=score,
-        total_reward=state.total_reward,
-        steps=state.step_count,
-        done=state.done,
-        metrics=state.metrics,
-    )
+            print(f"Step {step}: model suggested -> {actions}")
+
+            result = await env.step(SatelliteAction(satellite_actions=actions))
+            observation = result.observation
+            reward = result.reward or 0.0
+            total_reward += reward
+            history.append(f"step {step}: {actions} -> reward {reward:+.2f}")
+
+            print(
+                f"  Reward: {reward:+.2f} | Total: {total_reward:+.2f} "
+                f"| Done: {result.done}"
+            )
+
+            if REQUEST_DELAY > 0 and step < step_limit and not result.done:
+                time.sleep(REQUEST_DELAY)
+
+            if result.done:
+                print("Episode complete.")
+                break
+        else:
+            print(f"Reached max steps ({step_limit}).")
+
+        final_state = await env.state()
+        metrics = {}
+        if hasattr(observation, "metadata"):
+            metrics = {
+                key: float(value)
+                for key, value in (observation.metadata.get("metrics", {}) or {}).items()
+            }
+
+        # Reconstruct a lightweight canonical env state for deterministic grading.
+        # The grader only needs step count, metrics, and satellite battery values.
+        class _Sat:
+            def __init__(self, battery: float):
+                self.battery = battery
+
+        class _State:
+            def __init__(self) -> None:
+                self.metrics = metrics
+                self.satellites = [_Sat(sat.battery) for sat in observation.satellites]
+                self.step_count = getattr(final_state, "step_count", 0)
+                self.max_steps = step_limit
+
+        class _Env:
+            def state(self) -> _State:
+                return _State()
+
+        score = grader.grade_episode(_Env())  # type: ignore[arg-type]
+        return TaskRunResult(
+            task_name=task_name,
+            score=score,
+            total_reward=observation.total_reward,
+            steps=getattr(final_state, "step_count", 0),
+            done=bool(getattr(observation, "done", False)),
+            metrics=metrics,
+        )
+    finally:
+        await env.close()
 
 
 def print_summary(results: List[TaskRunResult]) -> None:
@@ -303,10 +379,16 @@ def print_summary(results: List[TaskRunResult]) -> None:
     print("=" * 50)
 
 
-def main() -> None:
+async def async_main() -> None:
     client = build_client()
-    results = [run_task(task_name, client) for task_name in TASK_ORDER]
+    results = []
+    for task_name in TASK_ORDER:
+        results.append(await run_task(task_name, client))
     print_summary(results)
+
+
+def main() -> None:
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
