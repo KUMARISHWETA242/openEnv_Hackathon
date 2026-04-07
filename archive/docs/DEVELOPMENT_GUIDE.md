@@ -33,8 +33,9 @@ pip install -e .
 # Run basic tests
 python test_env.py
 
-# Run inference tests (using Groq)
-export GROQ_API_KEY="your-key-here"
+# Run inference tests (using Hugging Face Inference API)
+export HF_TOKEN="your-key-here"
+export MODEL_NAME="gpt2"
 python inference.py
 
 # Validate OpenEnv compliance
@@ -51,8 +52,8 @@ satellite-constellation-env/
 │   ├── tasks.py            # Task definitions
 │   └── graders.py          # Performance evaluation
 ├── openenv.yaml            # Environment metadata
-├── inference.py            # LLM inference script (Groq-compatible)
-├── baseline.py             # Groq baseline implementation
+├── inference.py            # LLM inference script (Hugging Face Inference API)
+├── baseline.py             # HF baseline implementation
 ├── requirements.txt        # Python dependencies
 ├── Dockerfile              # Container configuration
 ├── README.md               # Main documentation

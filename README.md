@@ -136,11 +136,13 @@ state = env.state()
 
 ## Baseline Scores
 
-Run the baseline inference script to get reproducible scores (using Groq):
+Run the baseline inference script to get reproducible scores (using Hugging Face Inference API):
 
 ```bash
-export GROQ_API_KEY="your-api-key-here"
-export GROQ_API_URL="https://api.groq.ai/v1/models/<model>/completions"  # optional
+export HF_TOKEN="your-hf-token-here"
+export MODEL_NAME="gpt2"  # or your preferred HF model
+# optional: override default endpoint
+export API_BASE_URL="https://api-inference.huggingface.co/models/<model>"
 python baseline.py
 ```
 

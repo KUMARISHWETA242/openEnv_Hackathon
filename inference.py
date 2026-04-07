@@ -18,18 +18,29 @@ import textwrap
 from typing import List, Dict, Any
 
 import json
-import requests
 from dotenv import load_dotenv
+import subprocess
+from openai import OpenAI
 
 from satellite_env import SatelliteConstellationEnv, Action, EasyTask, MediumTask, HardTask
 
 load_dotenv()
 
-# Groq configuration
-GROQ_API_URL = os.getenv("GROQ_API_URL") or os.getenv("API_BASE_URL") or os.getenv("GROQ_API_BASE")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME") or os.getenv("GROQ_MODEL") or "groq-1"
-MAX_STEPS = 50
+# Hugging Face configuration
+MODEL_NAME = os.getenv("MODEL_NAME") or os.getenv("HF_MODEL") or "gpt2"
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL")  # optional override
+DOCKER_IMAGE = os.getenv("DOCKER_IMAGE") or "satellite-env:latest"
+
+# Instantiate the provided wrapper client targeting the Hugging Face router
+try:
+    client = OpenAI(
+        base_url="https://router.huggingface.co/v1",
+        api_key=os.environ["HF_TOKEN"],
+    )
+except KeyError:
+    raise ValueError("HF_TOKEN environment variable not set; required to instantiate OpenAI wrapper client")
+MAX_STEPS = 100
 TEMPERATURE = 0.2
 MAX_TOKENS = 300
 FALLBACK_ACTION = {"satellite_actions": {}}
@@ -164,17 +175,9 @@ def parse_model_action(response_text: str, num_satellites: int) -> Dict[str, Any
 def run_inference(task_name: str = "easy") -> Dict[str, Any]:
     """Run inference on the specified task."""
 
-    # Initialize Groq client (HTTP)
-    if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY or API_KEY environment variable not set")
-
-    if not GROQ_API_URL:
-        GROQ_API_URL = f"https://api.groq.ai/v1/models/{MODEL_NAME}/completions"
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    # Ensure HF_TOKEN is present for the wrapper client
+    if not os.getenv("HF_TOKEN"):
+        raise ValueError("HF_TOKEN environment variable not set; required for the OpenAI wrapper client")
 
     # Set up task
     if task_name == "easy":
@@ -208,25 +211,27 @@ def run_inference(task_name: str = "easy") -> Dict[str, Any]:
             ]
 
             try:
-                payload = {
-                    "prompt": SYSTEM_PROMPT + "\n" + user_prompt,
-                    "max_tokens": MAX_TOKENS,
-                    "temperature": TEMPERATURE,
-                }
-                resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
-                resp.raise_for_status()
-                body = resp.json()
+                # Use OpenAI ChatCompletion API
+                prompt_text = SYSTEM_PROMPT + "\n" + user_prompt
+                resp = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=MAX_TOKENS,
+                    temperature=TEMPERATURE,
+                )
+
                 # extract text
                 response_text = ""
-                if isinstance(body, dict):
-                    if "choices" in body and len(body["choices"]) > 0:
-                        first = body["choices"][0]
-                        response_text = first.get("text") or first.get("message", {}).get("content", "")
-                    elif "output" in body:
-                        out = body["output"]
-                        response_text = out[0] if isinstance(out, list) and len(out) > 0 else (out if isinstance(out, str) else "")
+                if resp and getattr(resp, "choices", None):
+                    first = resp.choices[0]
+                    # ChatCompletion: message.content
+                    msg = getattr(first, "message", None) or first
+                    response_text = (msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)) or first.get("text", "")
                 if not response_text:
-                    response_text = json.dumps(body)
+                    response_text = json.dumps(resp)
             except Exception as exc:
                 print(f"Model request failed ({exc}). Using fallback action.")
                 response_text = json.dumps(FALLBACK_ACTION)
@@ -272,10 +277,23 @@ def run_inference(task_name: str = "easy") -> Dict[str, Any]:
 def main() -> None:
     """Main function to run inference on all tasks."""
 
-    if not all([GROQ_API_URL, GROQ_API_KEY, MODEL_NAME]):
+    if not all([HF_TOKEN, MODEL_NAME]):
         print("Error: Missing required environment variables:")
-        print("  GROQ_API_URL (or API_BASE_URL), GROQ_API_KEY (or API_KEY/HF_TOKEN), MODEL_NAME")
+        print("  HF_TOKEN (or API_KEY), MODEL_NAME")
+        print("Optionally set API_BASE_URL to override the default HF inference endpoint.")
         return
+
+    # Ensure Docker image is available locally (optional). The image name can
+    # be configured using the DOCKER_IMAGE environment variable. We attempt a
+    # best-effort `docker pull` so users who rely on the container image have
+    # it available before attempting to launch or inspect it.
+    try:
+        # Run a best-effort pull; don't fail the whole script if docker isn't
+        # available or the image can't be pulled.
+        subprocess.run(["docker", "pull", DOCKER_IMAGE], check=False)
+    except Exception:
+        # Ignore errors - environment can still run locally without Docker.
+        pass
 
     tasks = ["easy", "medium", "hard"]
     results = {}

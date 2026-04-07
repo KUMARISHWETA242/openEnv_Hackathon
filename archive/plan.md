@@ -12,13 +12,13 @@ This is a **real-world task simulation** - satellite constellation operations ma
 - ✅ **OpenEnv Environment**: Full spec compliance with typed Pydantic models
 - ✅ **3 Tasks with Graders**: Easy (3 sats), Medium (5 sats), Hard (8 sats)
 - ✅ **Reward Function**: Partial progress signals with action-specific rewards
- ✅ **Baseline Script**: Groq API integration for reproducible scores
- `baseline.py` - Groq API inference script
- **Baseline Scores**: Reproducible scores across all 3 tasks using Groq API
- 4. **Baseline Script**: Groq API integration with reproducible scores
- 2. **Run Baseline**: Execute baseline.py with GROQ_API_KEY
- **Baseline Scores**: Reproducible scores across all 3 tasks using Groq API
- 4. **Baseline Script**: Groq API integration with reproducible scores
+ ✅ **Baseline Script**: Hugging Face Inference API integration for reproducible scores
+ `baseline.py` - Hugging Face API inference script
+ **Baseline Scores**: Reproducible scores across all 3 tasks using the Hugging Face Inference API
+ 4. **Baseline Script**: HF Inference API integration with reproducible scores
+ 2. **Run Baseline**: Execute baseline.py with HF_TOKEN
+ **Baseline Scores**: Reproducible scores across all 3 tasks using the Hugging Face Inference API
+ 4. **Baseline Script**: HF Inference API integration with reproducible scores
 - `satellite_env/env.py` - Main environment with step/reset/state
 - `satellite_env/tasks.py` - Task definitions (Easy/Medium/Hard)
 - `satellite_env/graders.py` - Agent graders with scoring logic
