@@ -9,7 +9,13 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 import gradio as gr
 import plotly.graph_objects as go
 
-from satellite_env import Action, EasyTask, HardTask, MediumTask, SatelliteConstellationEnv
+from satellite import (
+    EasyTask,
+    HardTask,
+    MediumTask,
+    SatelliteAction,
+    SatelliteTaskEnv,
+)
 
 
 VALID_ACTIONS = ["capture", "downlink", "maintain", "idle"]
@@ -23,8 +29,7 @@ MAX_VISIBLE_SATELLITES = 8
 
 def create_session(task_name: str = "easy") -> Dict:
     task = TASKS[task_name]()
-    env = SatelliteConstellationEnv()
-    task.setup_environment(env)
+    env = SatelliteTaskEnv(task_name=task_name)
     observation = env.reset()
     return {
         "env": env,
@@ -86,7 +91,7 @@ def build_metrics_markdown(session: Dict) -> str:
         "### Mission Status\n"
         f"- Task: `{session['task_name']}`\n"
         f"- Description: {session['task_description']}\n"
-        f"- Time step: `{observation.time_step}` / `{session['env'].max_steps}`\n"
+        f"- Time step: `{observation.time_step}` / `{session['env'].state().max_steps}`\n"
         f"- Episode status: `{status}`\n"
         f"- Total reward: `{total_reward:.2f}`\n"
         f"- Avg battery: `{avg_battery:.1f}`\n"
@@ -387,7 +392,7 @@ def execute_steps(session: Dict, task_name: str, policy_name: str, run_steps: in
         if session["done"]:
             break
         chosen_actions = resolve_actions(session, policy_name, list(manual_actions))
-        action = Action(satellite_actions=chosen_actions)
+        action = SatelliteAction(satellite_actions=chosen_actions)
         observation, reward, done, _ = session["env"].step(action)
         session["observation"] = observation
         session["done"] = done

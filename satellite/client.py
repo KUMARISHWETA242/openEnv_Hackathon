@@ -1,12 +1,6 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+"""WebSocket client for the satellite OpenEnv server."""
 
-"""Satellite Environment Client."""
-
-from typing import Dict
+from typing import Any, Dict
 
 from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
@@ -15,84 +9,32 @@ from openenv.core.env_server.types import State
 from .models import SatelliteAction, SatelliteObservation
 
 
-class SatelliteEnv(
-    EnvClient[SatelliteAction, SatelliteObservation, State]
-):
-    """
-    Client for the Satellite Environment.
+class SatelliteEnv(EnvClient[SatelliteAction, SatelliteObservation, State]):
+    """Client for interacting with a running satellite environment server."""
 
-    This client maintains a persistent WebSocket connection to the environment server,
-    enabling efficient multi-step interactions with lower latency.
-    Each client instance has its own dedicated environment session on the server.
+    def _step_payload(self, action: SatelliteAction) -> Dict[str, Any]:
+        """Convert a typed action to the server step payload."""
+        return action.model_dump()
 
-    Example:
-        >>> # Connect to a running server
-        >>> with SatelliteEnv(base_url="http://localhost:8000") as client:
-        ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
-        ...
-        ...     result = client.step(SatelliteAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
-
-    Example with Docker:
-        >>> # Automatically start container and connect
-        >>> client = SatelliteEnv.from_docker_image("satellite-env:latest")
-        >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(SatelliteAction(message="Test"))
-        ... finally:
-        ...     client.close()
-    """
-
-    def _step_payload(self, action: SatelliteAction) -> Dict:
-        """
-        Convert SatelliteAction to JSON payload for step message.
-
-        Args:
-            action: SatelliteAction instance
-
-        Returns:
-            Dictionary representation suitable for JSON encoding
-        """
-        return {
-            "message": action.message,
-        }
-
-    def _parse_result(self, payload: Dict) -> StepResult[SatelliteObservation]:
-        """
-        Parse server response into StepResult[SatelliteObservation].
-
-        Args:
-            payload: JSON response data from server
-
-        Returns:
-            StepResult with SatelliteObservation
-        """
-        obs_data = payload.get("observation", {})
-        observation = SatelliteObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
-            done=payload.get("done", False),
-            reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
+    def _parse_result(self, payload: Dict[str, Any]) -> StepResult[SatelliteObservation]:
+        """Parse a server response into a typed step result."""
+        observation_data = payload.get("observation", payload)
+        observation = SatelliteObservation.model_validate(
+            {
+                **observation_data,
+                "done": payload.get("done", observation_data.get("done", False)),
+                "reward": payload.get("reward", observation_data.get("reward", 0.0)),
+                "metadata": observation_data.get("metadata", {}),
+            }
         )
-
         return StepResult(
             observation=observation,
-            reward=payload.get("reward"),
-            done=payload.get("done", False),
+            reward=payload.get("reward", observation.reward),
+            done=payload.get("done", observation.done),
         )
 
-    def _parse_state(self, payload: Dict) -> State:
-        """
-        Parse server response into State object.
-
-        Args:
-            payload: JSON response from state request
-
-        Returns:
-            State object with episode_id and step_count
-        """
+    def _parse_state(self, payload: Dict[str, Any]) -> State:
+        """Parse state payload into the OpenEnv state type."""
         return State(
             episode_id=payload.get("episode_id"),
             step_count=payload.get("step_count", 0),

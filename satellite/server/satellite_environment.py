@@ -4,23 +4,29 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""
-Satellite Environment Implementation.
-
-Manages a constellation of satellites for imaging and data downlinking tasks.
-"""
+"""OpenEnv-facing wrapper around the canonical satellite task environment."""
 
 from uuid import uuid4
 
-from openenv.core.env_server.interfaces import Environment
-from openenv.core.env_server.types import State
+from pydantic import BaseModel, Field
 
 try:
-    from ..models import SatelliteAction, SatelliteObservation, SatelliteState
-    from ..constellation import SatelliteConstellationEnv
+    from openenv.core.env_server.interfaces import Environment
+    from openenv.core.env_server.types import State
+except Exception:  # pragma: no cover - local fallback when openenv is absent
+    class Environment:  # type: ignore[override]
+        pass
+
+    class State(BaseModel):
+        episode_id: str = Field(default_factory=lambda: str(uuid4()))
+        step_count: int = 0
+
+try:
+    from ..env import SatelliteTaskEnv
+    from ..models import SatelliteAction, SatelliteObservation
 except ImportError:
-    from models import SatelliteAction, SatelliteObservation, SatelliteState
-    from constellation import SatelliteConstellationEnv
+    from env import SatelliteTaskEnv
+    from models import SatelliteAction, SatelliteObservation
 
 
 class SatelliteEnvironment(Environment):
@@ -44,7 +50,12 @@ class SatelliteEnvironment(Environment):
     # Each client gets their own environment instance.
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    def __init__(self, num_satellites: int = 5, max_steps: int = 100):
+    def __init__(
+        self,
+        task_name: str = "medium",
+        num_satellites: int = 5,
+        max_steps: int = 100,
+    ):
         """
         Initialize the satellite environment.
 
@@ -52,7 +63,8 @@ class SatelliteEnvironment(Environment):
             num_satellites: Number of satellites in the constellation
             max_steps: Maximum steps per episode
         """
-        self._constellation = SatelliteConstellationEnv(
+        self._env = SatelliteTaskEnv(
+            task_name=task_name,
             num_satellites=num_satellites, max_steps=max_steps
         )
         self._state = State(episode_id=str(uuid4()), step_count=0)
@@ -65,9 +77,10 @@ class SatelliteEnvironment(Environment):
             SatelliteObservation with initial satellite states and tasks
         """
         self._state = State(episode_id=str(uuid4()), step_count=0)
-        obs_dict = self._constellation.reset()
-
-        return self._dict_to_observation(obs_dict, reward=0.0, done=False)
+        observation = self._env.reset()
+        self._state.episode_id = self._env.episode_id
+        self._state.step_count = 0
+        return observation
 
     def step(self, action: SatelliteAction) -> SatelliteObservation:  # type: ignore[override]
         """
@@ -80,30 +93,8 @@ class SatelliteEnvironment(Environment):
             SatelliteObservation with updated states and reward
         """
         self._state.step_count += 1
-
-        obs_dict, reward, done, info = self._constellation.step(
-            action.satellite_actions
-        )
-
-        return self._dict_to_observation(obs_dict, reward=reward, done=done, info=info)
-
-    def _dict_to_observation(
-        self, obs_dict, reward: float, done: bool, info: dict = None
-    ) -> SatelliteObservation:
-        """Convert internal observation dict to SatelliteObservation."""
-        satellites = [SatelliteState(**sat) for sat in obs_dict["satellites"]]
-
-        return SatelliteObservation(
-            satellites=satellites,
-            time_step=obs_dict["time_step"],
-            ground_stations=obs_dict["ground_stations"],
-            weather_conditions=obs_dict["weather_conditions"],
-            pending_tasks=obs_dict["pending_tasks"],
-            total_reward=obs_dict["total_reward"],
-            done=done,
-            reward=reward,
-            metadata=info or {},
-        )
+        observation, _, _, _ = self._env.step(action)
+        return observation
 
     @property
     def state(self) -> State:
@@ -113,4 +104,7 @@ class SatelliteEnvironment(Environment):
         Returns:
             Current State with episode_id and step_count
         """
+        snapshot = self._env.state()
+        self._state.episode_id = snapshot.episode_id
+        self._state.step_count = snapshot.step_count
         return self._state

@@ -1,183 +1,212 @@
 # Satellite Constellation Management Environment
 
-This OpenEnv environment simulates managing a constellation of satellites with limited resources to maximize mission value through reinforcement learning.
+This repository contains a real-world OpenEnv submission for satellite fleet operations. Agents must manage image capture, data downlink, maintenance timing, and resource risk across three deterministic task presets.
 
-## Environment Description
+## Overview And Motivation
 
-Satellites have limited:
-- **Battery power** 🔋 (0-100%)
-- **Storage capacity** 💾 (0-100% used)
-- **Communication windows** 📡 (availability to ground stations)
+This environment models a realistic operations problem: coordinating a satellite fleet that must capture imagery, preserve onboard resources, and downlink data under changing weather and workload pressure.
 
-Tasks include:
-- 🌍 **Capture Earth images** (consumes battery, fills storage)
-- 📡 **Downlink data** to ground stations (requires communication window, consumes battery, frees storage)
-- 🔧 **Perform maintenance maneuvers** (recharges battery)
+It is intended as a meaningful agent benchmark because good performance requires:
+- balancing short-term task completion against long-term battery and storage health
+- choosing among competing operational priorities
+- avoiding wasteful or destructive actions across long trajectories
+- adapting strategy as task mix and constellation size increase from easy to hard
 
-The environment is dynamic with:
-- Orbital mechanics (satellite positions change)
-- Weather conditions (affects imaging quality)
-- Resource depletion over time
-- Ground station visibility windows
+## What Is Included
 
-## Documentation
+- Canonical environment package: `satellite/`
+- Typed Pydantic models for observation, action, reward, and state
+- Three built-in tasks: `easy`, `medium`, `hard`
+- Deterministic task grader returning scores from `0.0` to `1.0`
+- Reward shaping for progress, efficiency, and bad behavior penalties
+- Baseline inference runner at `inference.py`
+- Local validator-ready OpenEnv app manifest at `satellite/openenv.yaml`
 
-For detailed information, see:
-- **[API Documentation](API_DOCUMENTATION.md)**: Complete API reference and usage examples
-- **[Task Specifications](TASK_SPECIFICATIONS.md)**: Detailed task descriptions and evaluation criteria
-- **[Environment Details](ENVIRONMENT_DETAILS.md)**: Technical implementation and simulation models
-- **[Development Guide](DEVELOPMENT_GUIDE.md)**: Instructions for extending and modifying the environment
+## Task Progression
 
-## Action and Observation Spaces
+| Task | Satellites | Max Steps | Workload | Main Difficulty |
+|------|------------|-----------|----------|-----------------|
+| Easy | 3 | 50 | 5 image tasks | Basic resource management |
+| Medium | 5 | 100 | 12 mixed tasks | Capture/downlink balancing |
+| Hard | 8 | 200 | 20 mixed tasks | Heavier weather, more coordination, stricter grading |
 
-### Observation Space
-The observation is a structured object containing:
-- `satellites`: List of satellite states
-  - `id`: Satellite identifier
-  - `position`: (x, y, z) coordinates in orbit
-  - `battery`: Current battery level (0-100)
-  - `storage`: Storage usage percentage (0-100)
-  - `last_action`: Previous action taken
-- `time_step`: Current simulation time step
-- `ground_stations`: List of (latitude, longitude) for ground stations
-- `weather_conditions`: Dict mapping regions to cloud cover (0-1)
-- `pending_tasks`: List of tasks requiring attention
+The progression is explicit in both configuration and grading:
+- `easy` focuses on simple image completion and battery health
+- `medium` adds meaningful downlink workload and more task completions
+- `hard` increases fleet size, task count, cloud pressure, and invalid-action sensitivity
 
-### Action Space
-Actions are specified per satellite as a dictionary:
-- `satellite_actions`: Dict[satellite_id -> action]
-- Available actions:
-  - `"capture"`: Take an image (battery -5, storage +10 if possible)
-  - `"downlink"`: Send data to ground station (if in range, battery -2, storage -20)
-  - `"maintain"`: Perform maintenance (battery +20)
-  - `"idle"`: No action
+## Canonical API
 
-### Reward Function
-Rewards provide partial progress signals:
-- **+10** per successful image capture
-- **+2** per unit of data downlinked
-- **+5** per maintenance action
-- **-1** per invalid action attempt
-- Battery drain of 0.5 per time step
-
-## Tasks
-
-### Easy Task: Basic Imaging
-- 3 satellites, 50 time steps
-- Capture at least 3 images
-- Maintain average battery >50%
-- **Target Score**: 0.7
-
-### Medium Task: Data Management
-- 5 satellites, 100 time steps
-- Capture at least 5 images
-- Downlink at least 50 units of data
-- Maintain average battery >30%
-- **Target Score**: 0.5
-
-### Hard Task: Constellation Coordination
-- 8 satellites, 200 time steps
-- Handle weather constraints
-- Capture at least 10 images
-- Downlink at least 100 units of data
-- Maintain average battery >20%
-- **Target Score**: 0.3
-
-## Setup Instructions
-
-### Local Installation
-
-1. **Clone and navigate to the repository**
-   ```bash
-   git clone <repository-url>
-   cd satellite-constellation-env
-   ```
-
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Validate the environment**
-   ```bash
-   python -c "import openenv; openenv.validate('.')"
-   ```
-
-### Docker Setup
-
-1. **Build the container**
-   ```bash
-   docker build -t satellite-env .
-   ```
-
-2. **Run the container**
-   ```bash
-   docker run -p 7860:7860 satellite-env
-   ```
-
-## Usage Example
+Use `SatelliteTaskEnv` for the submission-facing environment API:
 
 ```python
-from satellite_env import SatelliteConstellationEnv, Action
+from satellite import SatelliteAction, SatelliteTaskEnv
 
-# Initialize environment
-env = SatelliteConstellationEnv(num_satellites=5)
-
-# Reset for new episode
+env = SatelliteTaskEnv(task_name="medium")
 observation = env.reset()
 
-# Take actions
-action = Action(satellite_actions={0: "capture", 1: "downlink", 2: "maintain"})
-observation, reward, done, info = env.step(action)
+observation, reward, done, info = env.step(
+    SatelliteAction(satellite_actions={0: "capture", 1: "maintain"})
+)
 
-# Get current state
 state = env.state()
+```
+
+Key methods:
+- `reset() -> SatelliteObservation`
+- `step(action) -> (SatelliteObservation, SatelliteReward, done, info)`
+- `state() -> SatelliteEnvState`
+- `SatelliteTaskEnv.list_tasks() -> Dict[str, str]`
+
+## Action And Observation Spaces
+
+### Action Space
+
+The action space is a typed `SatelliteAction` object with one command per satellite:
+
+```python
+SatelliteAction(
+    satellite_actions={
+        0: "capture",
+        1: "downlink",
+        2: "maintain",
+        3: "idle",
+    }
+)
+```
+
+Allowed actions:
+- `capture`: collect imagery for an image task
+- `downlink`: transmit stored data toward a downlink task
+- `maintain`: recover battery and preserve fleet health
+- `idle`: take no productive action this step
+
+### Observation Space
+
+The observation space is a typed `SatelliteObservation` object containing:
+- `satellites`: per-satellite state with `id`, `position`, `battery`, `storage`, and `last_action`
+- `time_step`: current step in the episode
+- `ground_stations`: available ground-station coordinates
+- `weather_conditions`: cloud cover by region
+- `pending_tasks`: currently visible image/downlink tasks
+- `total_reward`: cumulative reward so far
+- `reward`: immediate reward from the latest step
+- `done`: whether the episode has ended
+- `metadata`: step metadata such as reward components and metrics
+
+## Reward Model
+
+Rewards are shaped during the trajectory, not only at the end:
+- positive reward for completing image and downlink tasks
+- additional reward for finishing full downlink workloads
+- moderate reward for timely maintenance
+- penalties for invalid actions
+- penalties for repeated wasteful actions
+- penalties for risky low-battery or overfull-storage behavior
+- mild penalty for unproductive idling when useful work is available
+
+## Grading
+
+`TaskGrader` scores episodes deterministically from environment metrics, including:
+- completed image tasks
+- downlinked units
+- total tasks completed
+- final average battery
+- invalid-action rate
+
+## Local Setup
+
+Create the local virtualenv and install the OpenEnv runtime:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install "openenv-core[core]"
+```
+
+## Validate The Environment
+
+The OpenEnv environment root is `satellite/`, not the repo root.
+
+Use either:
+
+```bash
+.venv/bin/openenv validate satellite
+```
+
+or:
+
+```bash
+cd satellite
+../.venv/bin/openenv validate .
 ```
 
 ## Dashboard
 
-Launch the local simulation dashboard with:
+Run the local dashboard with:
 
 ```bash
-python dashboard.py
+python3 dashboard.py
 ```
 
-This opens a Gradio interface where you can:
-- Reset to the easy, medium, or hard task
-- Run one or many environment steps
-- Switch between heuristic, random, and manual action selection
-- Monitor satellite battery, storage, latest actions, rewards, and orbit positions
+It supports:
+- task switching across `easy`, `medium`, and `hard`
+- heuristic, random, and manual action selection
+- reward and fleet-state inspection
 
-## Baseline Scores
+## Baseline Inference
 
-Run the baseline inference script to get reproducible scores (using Groq):
+The baseline script evaluates all three tasks and prints:
+- per-task score
+- per-task reward
+- per-task step count
+- final aggregate score
+
+Set:
 
 ```bash
-export GROQ_API_KEY="your-api-key-here"
-export GROQ_API_URL="https://api.groq.ai/v1/models/<model>/completions"  # optional
-python baseline.py
+export HF_TOKEN="your-token"
+export MODEL_NAME="your-model"
+export API_BASE_URL="https://router.huggingface.co/v1"
+python3 inference.py
 ```
 
-Expected baseline scores (using GPT-4):
-- Easy: ~0.7
-- Medium: ~0.5
-- Hard: ~0.3
+The script uses the OpenAI Python client and reads credentials from `HF_TOKEN`.
 
-## Deployment to Hugging Face Spaces
+### Reproducible Baseline Scores
 
-1. **Create a new Space** on Hugging Face with Docker
-2. **Push your code** to the repository
-3. **The Space will automatically build** using the Dockerfile
-4. **Access the environment** via the web interface
+The repository also supports a deterministic heuristic baseline that can be reproduced locally without a remote model:
 
-## Contributing
+```bash
+BASELINE_POLICY=heuristic python3 inference.py
+```
 
-This environment is designed for the OpenEnv Hackathon. Contributions should focus on:
-- Improving the physical accuracy of satellite dynamics
-- Adding more realistic weather and orbital models
-- Enhancing the reward function for better learning signals
-- Optimizing performance for larger constellations
+Current baseline scores:
 
-## License
+| Task | Score | Reward | Steps | Done |
+|------|-------|--------|-------|------|
+| easy | 1.0000 | 34.60 | 50 | True |
+| medium | 1.0000 | 126.70 | 100 | True |
+| hard | 1.0000 | 170.40 | 200 | True |
 
-MIT License - see LICENSE file for details.
+Aggregate heuristic baseline score: `1.0000`
+
+## Project Structure
+
+```text
+openEnv_Hackathon/
+├── dashboard.py
+├── inference.py
+├── satellite/
+│   ├── __init__.py
+│   ├── constellation.py
+│   ├── env.py
+│   ├── graders.py
+│   ├── models.py
+│   ├── openenv.yaml
+│   ├── pyproject.toml
+│   ├── tasks.py
+│   └── server/
+│       ├── app.py
+│       └── satellite_environment.py
+└── docs/
+```
